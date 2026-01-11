@@ -6,6 +6,11 @@ from datetime import datetime
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+# Silence TF GPU warnings on CPU-only deployments
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 from prediction_pipeline import ScamDetector
 
 # Configure logging
