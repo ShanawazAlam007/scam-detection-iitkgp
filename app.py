@@ -1,8 +1,20 @@
 import os
 import numpy as np
-from flask import Flask, request, jsonify
+import uuid
+import logging
+from datetime import datetime
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from prediction_pipeline import ScamDetector
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Use absolute paths for model files for robustness in any environment
 # __file__ gives the path of the current script.
@@ -11,17 +23,25 @@ MODEL_PATH = os.path.join(BASE_DIR, 'trained_model.h5')
 TOKENIZER_PATH = os.path.join(BASE_DIR, 'tokenizer.pkl')
 SCALER_PATH = os.path.join(BASE_DIR, 'metadata_scaler.pkl')
 
+# Environment configuration
+HOST = os.getenv('HOST', '0.0.0.0')
+PORT = int(os.getenv('PORT', 5000))
+DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
+
 # Load the model once at startup
-print("Loading scam detection model...")
+logger.info("Loading scam detection model...")
 try:
     detector = ScamDetector(MODEL_PATH, TOKENIZER_PATH, SCALER_PATH)
-    print("Model loaded successfully.")
+    logger.info("Model loaded successfully.")
 except Exception as e:
-    print(f"FATAL: Could not load model. Error: {e}")
+    logger.error(f"FATAL: Could not load model. Error: {e}")
     detector = None
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Add ProxyFix middleware for proper header handling behind proxies
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Enable CORS with explicit configuration to avoid CORS errors
 CORS(app, resources={
@@ -44,6 +64,35 @@ app.config['JSON_SORT_KEYS'] = False
 # Constants for validation
 MAX_TEXT_LENGTH = 50000  # Maximum characters in text input
 MIN_TEXT_LENGTH = 1  # Minimum characters in text input
+
+# Request tracking and security headers
+@app.before_request
+def before_request():
+    """Add request ID and track request start time."""
+    g.request_id = str(uuid.uuid4())[:8]
+    g.start_time = datetime.now()
+    logger.info(f"[{g.request_id}] {request.method} {request.path}")
+
+@app.after_request
+def after_request(response):
+    """Add security headers and request tracking."""
+    # Security headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    
+    # Request tracking
+    if hasattr(g, 'request_id'):
+        response.headers['X-Request-ID'] = g.request_id
+    
+    # Response time
+    if hasattr(g, 'start_time'):
+        duration = (datetime.now() - g.start_time).total_seconds() * 1000
+        response.headers['X-Response-Time'] = f"{duration:.2f}ms"
+        logger.info(f"[{g.request_id}] {response.status_code} - {duration:.2f}ms")
+    
+    return response
 
 @app.route("/", methods=["GET"])
 def root():
@@ -115,13 +164,9 @@ def predict():
         if isinstance(confidence, np.floating):
             confidence = float(confidence)
 
-        # Log details to terminal for debugging
-        print("--- New Prediction ---")
-        print(f"Input Text: {text}")
-        print(f"Decision Source: {source}")
-        print(f"Final Prediction: {prediction_label}")
-        print(f"Confidence: {confidence:.4f}" if confidence is not None else "Confidence: N/A")
-        print("----------------------")
+        # Log details for debugging
+        confidence_str = f"{confidence:.4f}" if confidence is not None else "N/A"
+        logger.info(f"[{g.request_id}] Prediction: {prediction_label} | Source: {source} | Confidence: {confidence_str}")
 
         # Return the response with ONLY the prediction key, as required
         response = jsonify({"prediction": prediction_label})
@@ -131,13 +176,11 @@ def predict():
 
     except ValueError as ve:
         # Handle specific validation errors
-        print(f"Validation error: {ve}")
+        logger.warning(f"[{g.request_id}] Validation error: {ve}")
         return jsonify({"error": str(ve)}), 400
     except Exception as e:
         # Log the full error for debugging but return a generic message
-        print(f"ERROR: An unhandled exception occurred during prediction: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"[{g.request_id}] Unhandled exception: {e}", exc_info=True)
         return jsonify({"error": "An internal error occurred during prediction."}), 500
 
 # Global error handlers
@@ -163,22 +206,25 @@ def internal_server_error(error):
 
 if __name__ == '__main__':
     if not detector:
-        print("FATAL: Backend not starting because model failed to load.")
+        logger.error("FATAL: Backend not starting because model failed to load.")
         exit(1)
     else:
-        print("="*60)
-        print("Starting Flask backend for local testing on http://0.0.0.0:5000")
-        print("Backend will be accessible from any network interface")
-        print("CORS enabled for all origins")
-        print(f"Max text length: {MAX_TEXT_LENGTH} characters")
-        print(f"Max request size: 10MB")
-        print("="*60)
+        logger.info("="*60)
+        logger.info(f"Starting Flask backend on http://{HOST}:{PORT}")
+        logger.info("Backend will be accessible from any network interface")
+        logger.info("CORS enabled for all origins")
+        logger.info(f"Max text length: {MAX_TEXT_LENGTH} characters")
+        logger.info(f"Max request size: 10MB")
+        logger.info("Security headers enabled")
+        logger.info("Request tracking enabled")
+        logger.info("="*60)
+        logger.warning("⚠️  Using Flask development server. For production, use: gunicorn -w 4 -b 0.0.0.0:5000 app:app")
         # Use 0.0.0.0 to allow connections from other devices/frontend
         # Disable debug mode in production, use threaded=True for better performance
         try:
-            app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+            app.run(host=HOST, port=PORT, debug=DEBUG, threaded=True)
         except KeyboardInterrupt:
-            print("\nShutting down gracefully...")
+            logger.info("\nShutting down gracefully...")
         except Exception as e:
-            print(f"\nFATAL: Server crashed with error: {e}")
+            logger.error(f"\nFATAL: Server crashed with error: {e}", exc_info=True)
             exit(1)
